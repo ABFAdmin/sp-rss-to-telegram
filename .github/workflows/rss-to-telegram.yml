@@ -1,4 +1,4 @@
-name: RSS → Telegram
+name: SharePoint → Telegram
 
 on:
   schedule:
@@ -8,44 +8,98 @@ on:
 jobs:
   notify:
     runs-on: ubuntu-latest
+
     steps:
-      - name: Fetch RSS & notify Telegram
+      - name: Check out repo
+        uses: actions/checkout@v4
+
+      - name: Fetch SP items & notify Telegram
         env:
-          BOT_TOKEN:  ${{ secrets.BOT_TOKEN }}
-          CHAT_ID:    ${{ secrets.CHAT_ID }}
-          RSS_URL:    ${{ secrets.RSS_URL }}
-          STATE_FILE: last_rss.json
+          BOT_TOKEN:           ${{ secrets.BOT_TOKEN }}
+          CHAT_ID:             ${{ secrets.CHAT_ID }}
+          AZURE_TENANT_ID:     ${{ secrets.AZURE_TENANT_ID }}
+          AZURE_CLIENT_ID:     ${{ secrets.AZURE_CLIENT_ID }}
+          AZURE_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
         run: |
-          sudo apt-get update && sudo apt-get install -y python3-feedparser
+          pip3 install msal requests
+
           python3 - << 'EOF'
-          import os, json, time, feedparser, requests, pathlib
+          import os, json, requests, pathlib
+          from msal import ConfidentialClientApplication
+          from datetime import datetime
 
-          bot     = os.environ['BOT_TOKEN']
-          chat    = os.environ['CHAT_ID']
-          url     = os.environ['RSS_URL']
-          state_f = pathlib.Path(os.getcwd()) / os.environ['STATE_FILE']
+          # Telegram bot & chat
+          bot           = os.environ['BOT_TOKEN']
+          chat          = os.environ['CHAT_ID']
 
-          # load last-run timestamp (default: 1 hour ago)
-          last = int(time.time()) - 3600
-          if state_f.exists():
-            last = json.loads(state_f.read_text()).get('last', last)
+          # Azure AD app credentials
+          tenant        = os.environ['AZURE_TENANT_ID']
+          client_id     = os.environ['AZURE_CLIENT_ID']
+          client_secret = os.environ['AZURE_CLIENT_SECRET']
 
-          feed = feedparser.parse(url)
+          # Your SharePoint site and list
+          site_id = "airblowfanscoza.sharepoint.com:/sites/ABF-Manufacturing"
+          list_id = "E33DEFA0-905A-4396-9DBB-64AFC4AF1FA6"
+
+          # State file to persist last timestamp
+          state_file = pathlib.Path("last_state.json")
+          last = int(datetime.utcnow().timestamp()) - 3600
+          if state_file.exists():
+            last = json.loads(state_file.read_text()).get("last", last)
+
+          # Acquire Graph token
+          app   = ConfidentialClientApplication(
+                     client_id,
+                     authority=f"https://login.microsoftonline.com/{tenant}",
+                     client_credential=client_secret
+                   )
+          token = app.acquire_token_for_client(
+                     scopes=["https://graph.microsoft.com/.default"]
+                   )["access_token"]
+          headers = {"Authorization": f"Bearer {token}"}
+
+          # Fetch up to 20 newest items ordered by Created desc
+          url = (
+            f"https://graph.microsoft.com/v1.0/sites/{site_id}"
+            f"/lists/{list_id}/items"
+            "?$top=20&$expand=fields&$orderby=fields/Created desc"
+          )
+          resp = requests.get(url, headers=headers)
+          resp.raise_for_status()
+          items = resp.json().get("value", [])
+
           new_last = last
+          for itm in reversed(items):
+            flds = itm.get("fields", {})
+            created = flds.get("Created")
+            try:
+              ts = int(datetime.strptime(created, "%Y-%m-%dT%H:%M:%SZ").timestamp())
+            except:
+              continue
+            if ts <= last:
+              continue
 
-          for e in feed.entries:
-            pub = e.get('published_parsed') or e.get('updated_parsed')
-            if not pub: continue
-            ts = int(time.mktime(pub))
-            if ts <= last: continue
+            title = flds.get("Title", "(no title)")
+            link  = flds.get("EncodedAbsUrl")
+            text  = f"*{title}*\n{link}"
 
-            text = f"*{e.title}*\n{e.link}"
-            resp = requests.post(
+            post = requests.post(
               f"https://api.telegram.org/bot{bot}/sendMessage",
-              json={"chat_id":chat, "parse_mode":"Markdown", "text":text}
+              json={"chat_id": chat, "parse_mode": "Markdown", "text": text}
             )
-            resp.raise_for_status()
+            post.raise_for_status()
+
             new_last = max(new_last, ts)
 
-          state_f.write_text(json.dumps({"last":new_last}))
+          # Persist new last timestamp
+          with open(state_file, "w") as f:
+            json.dump({"last": new_last}, f)
           EOF
+
+      - name: Commit updated state
+        run: |
+          git config --local user.email "actions@github.com"
+          git config --local user.name  "GitHub Actions"
+          git add last_state.json
+          git commit -m "Update last_state" || echo "No changes to commit"
+          git push origin HEAD:main || echo "Push failed"
