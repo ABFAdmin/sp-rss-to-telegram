@@ -15,9 +15,9 @@ jobs:
       - name: Fetch SP items & notify Telegram
         # these must match the names of the GitHub repository secrets you created
         env:
-          CLIENT_ID:     ${{ secrets.CLIENT_ID }}
-          TENANT_ID:     ${{ secrets.TENANT_ID }}
-          CLIENT_SECRET: ${{ secrets.CLIENT_SECRET }}
+          CLIENT_ID:     ${{ secrets.AZURE_CLIENT_ID }}
+          CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
+          TENANT_ID:     ${{ secrets.AZURE_TENANT_ID }}
           SITE_ID:       ${{ secrets.SITE_ID }}
           LIST_ID:       ${{ secrets.LIST_ID }}
           BOT_TOKEN:     ${{ secrets.BOT_TOKEN }}
