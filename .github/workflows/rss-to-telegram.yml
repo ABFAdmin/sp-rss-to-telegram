@@ -9,7 +9,6 @@ on:
 jobs:
   notify:
     runs-on: ubuntu-latest
-
     steps:
       # 1) pull your code
       - name: Check out repository
@@ -40,9 +39,9 @@ jobs:
 
           # — AUTH with Azure AD —
           app = msal.ConfidentialClientApplication(
-            os.environ['AZURE_CLIENT_ID'],
-            authority=f"https://login.microsoftonline.com/{os.environ['AZURE_TENANT_ID']}",
-            client_credential=os.environ['AZURE_CLIENT_SECRET']
+              os.environ['AZURE_CLIENT_ID'],
+              authority=f"https://login.microsoftonline.com/{os.environ['AZURE_TENANT_ID']}",
+              client_credential=os.environ['AZURE_CLIENT_SECRET']
           )
           token_resp = app.acquire_token_for_client(["https://graph.microsoft.com/.default"])
           if "access_token" not in token_resp:
@@ -50,14 +49,14 @@ jobs:
               exit(1)
           token = token_resp["access_token"]
 
-          # — BUILD Graph URL —
+          # — BUILD Graph URL (ordered by creation time) —
           site = os.environ['SITE_ID']
           lst  = os.environ['LIST_ID']
           url = (
-            f"https://graph.microsoft.com/v1.0/sites/{site}"
-            f"/lists/{lst}/items"
-            f"?$expand=fields"
-            f"&$orderby=createdDateTime desc"
+              f"https://graph.microsoft.com/v1.0/sites/{site}"
+              f"/lists/{lst}/items"
+              f"?$expand=fields"
+              f"&$orderby=createdDateTime desc"
           )
           print("➡️ Fetching:", url)
 
@@ -91,12 +90,12 @@ jobs:
               link  = itm.get("webUrl")
               print(f"   ↳ SENDING message: {title}")
               p = requests.post(
-                f"https://api.telegram.org/bot{os.environ['BOT_TOKEN']}/sendMessage",
-                json={
-                  "chat_id": os.environ['CHAT_ID'],
-                  "parse_mode": "Markdown",
-                  "text": f"*{title}*\n{link}"
-                }
+                  f"https://api.telegram.org/bot{os.environ['BOT_TOKEN']}/sendMessage",
+                  json={
+                      "chat_id": os.environ['CHAT_ID'],
+                      "parse_mode": "Markdown",
+                      "text": f"*{title}*\n{link}"
+                  }
               )
               p.raise_for_status()
               new_last = max(new_last, ts)
