@@ -1,6 +1,6 @@
 name: SharePoint → Telegram
 
-# Run every 10 minutes + allow manual dispatch
+# every 10m, can also be triggered manually
 on:
   schedule:
     - cron: '*/10 * * * *'
@@ -11,11 +11,9 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      # 1) pull your code
       - name: Check out repository
         uses: actions/checkout@v3
 
-      # 2) fetch items & post to Telegram
       - name: Fetch SP items & notify Telegram
         env:
           AZURE_CLIENT_ID:     ${{ secrets.AZURE_CLIENT_ID }}
@@ -61,7 +59,7 @@ jobs:
           )
           print("➡️ Fetching:", url)
 
-          # — LOAD last timestamp (default: 0 on first run) —
+          # — LOAD last timestamp (first run = backfill) —
           state_file = pathlib.Path("last_state.json")
           last = 0
           if state_file.exists():
@@ -89,16 +87,20 @@ jobs:
 
               title = itm.get("fields", {}).get("Title", "<no title>")
               link  = itm.get("webUrl")
+              text  = f"*{title}*\n{link}"
               print(f"   ↳ SENDING message: {title}")
               p = requests.post(
                 f"https://api.telegram.org/bot{os.environ['BOT_TOKEN']}/sendMessage",
                 json={
                   "chat_id": os.environ['CHAT_ID'],
-                  "parse_mode": "Markdown",
-                  "text": f"*{title}*\n{link}"
+                  "text": text
                 }
               )
-              p.raise_for_status()
+              # if it fails, dump the full error body
+              if not p.ok:
+                  print("🚨 Telegram error:", p.status_code, p.text)
+                  exit(1)
+
               new_last = max(new_last, ts)
               print(f"   ↳ new_last updated to {new_last}")
 
