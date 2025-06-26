@@ -49,7 +49,7 @@ jobs:
               exit(1)
           token = token_resp["access_token"]
 
-          # — BUILD Graph URL (ordered by creation time) —
+          # — BUILD Graph URL —
           site = os.environ['SITE_ID']
           lst  = os.environ['LIST_ID']
           url = (
