@@ -1,20 +1,27 @@
 name: SharePoint → Telegram
 
-# run every 10 minutes, and allow manual dispatch
 on:
   schedule:
-    - cron: '*/10 * * * *'
+    - cron: '*/10 * * * *'      # every 10 minutes
   workflow_dispatch:
 
 jobs:
   notify:
     runs-on: ubuntu-latest
+
     steps:
-      # 1) pull your code
       - name: Check out repository
         uses: actions/checkout@v3
 
-      # 2) fetch items & post to Telegram
+      # 1) Restore our last_state.json from cache (if any)
+      - name: Restore last_state cache
+        uses: actions/cache@v3
+        with:
+          path: last_state.json
+          key: last-state-${{ runner.os }}        # one cache per OS
+          restore-keys: |
+            last-state-${{ runner.os }}
+
       - name: Fetch SP items & notify Telegram
         env:
           AZURE_CLIENT_ID:     ${{ secrets.AZURE_CLIENT_ID }}
@@ -26,8 +33,14 @@ jobs:
           CHAT_ID:             ${{ secrets.CHAT_ID }}
         run: |
           set -euo pipefail
-          echo "🔧 Installing Python packages…"
+
+          echo "🔧 Installing Python packages..."
           pip install --user msal requests
+
+          echo "🐝 Debug BOT_TOKEN=${BOT_TOKEN:0:10}…"
+          echo "🐝 Debug CHAT_ID=$CHAT_ID"
+          echo "🐝 Debug SITE_ID=$SITE_ID"
+          echo "🐝 Debug LIST_ID=$LIST_ID"
 
           python3 - << 'EOF'
           import os, json, time, msal, requests, pathlib
@@ -51,7 +64,7 @@ jobs:
             f"https://graph.microsoft.com/v1.0/sites/{site}"
             f"/lists/{lst}/items"
             f"?$expand=fields"
-            f"&$orderby=createdDateTime desc"
+            f"&$orderby=fields/CreatedDateTime%20desc"
           )
           print("➡️ Fetching:", url)
 
@@ -60,6 +73,7 @@ jobs:
           last = int(time.time()) - 3600
           if state_file.exists():
               last = json.loads(state_file.read_text()).get("last", last)
+          print(f"🕒 Loaded last timestamp = {last}")
 
           # — FETCH & LOOP —
           resp = requests.get(url, headers={"Authorization": f"Bearer {token}"})
@@ -69,30 +83,37 @@ jobs:
 
           new_last = last
           for idx, itm in enumerate(items, start=1):
-              dt = itm.get("createdDateTime")
+              dt = itm.get("fields", {}).get("CreatedDateTime") or itm.get("createdDateTime")
+              print(f"🔄 Loop #{idx} — id={itm.get('id')} createdDateTime={dt}")
               if not dt:
                   continue
               ts = int(time.mktime(time.strptime(dt, "%Y-%m-%dT%H:%M:%SZ")))
               if ts <= last:
+                  print("   ↳ STOP—no newer items")
                   break
 
               title = itm["fields"].get("Title", "<no title>")
               link  = itm.get("webUrl")
-              text  = f"{title}\n{link}"
-
-              # POST to Telegram (no parse_mode)
-              p = requests.post(
+              print(f"   ↳ SENDING message: {title}")
+              result = requests.post(
                 f"https://api.telegram.org/bot{os.environ['BOT_TOKEN']}/sendMessage",
-                json={"chat_id": os.environ['CHAT_ID'], "text": text}
+                json={
+                  "chat_id": os.environ['CHAT_ID'],
+                  "parse_mode": "Markdown",
+                  "text": f"*{title}*\n{link}"
+                }
               )
-              try:
-                  p.raise_for_status()
-              except Exception as e:
-                  print("Telegram error →", p.status_code, p.text)
-                  raise
-
+              result.raise_for_status()
               new_last = max(new_last, ts)
 
-          # — SAVE state —
+          # — SAVE state for next run —
           state_file.write_text(json.dumps({"last": new_last}))
+          print(f"💾 Saved new timestamp = {new_last}")
           EOF
+
+      # 2) Save the updated last_state.json back into the cache
+      - name: Save last_state cache
+        uses: actions/cache@v3
+        with:
+          path: last_state.json
+          key: last-state-${{ runner.os }}
