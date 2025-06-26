@@ -10,11 +10,10 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Check out code
+      - name: Checkout repository
         uses: actions/checkout@v3
 
       - name: Install deps & run notifier
-        # use bash so heredoc works
         shell: bash
         env:
           AZURE_CLIENT_ID:     ${{ secrets.AZURE_CLIENT_ID }}
@@ -26,8 +25,7 @@ jobs:
           CHAT_ID:             ${{ secrets.CHAT_ID }}
         run: |
           set -euo pipefail
-
-          echo "🔧 Installing Python packages…"
+          echo "🔧 Installing Python packages..."
           pip install --user msal requests
 
           echo "🐞 Debug BOT_TOKEN=${BOT_TOKEN:0:10}…"
@@ -35,63 +33,61 @@ jobs:
           echo "🐞 Debug SITE_ID=$SITE_ID"
           echo "🐞 Debug LIST_ID=$LIST_ID"
 
-          python3 - << 'EOF'
-import os, json, time, msal, requests, pathlib
+          python3 << 'EOF'
+          import os, json, time, msal, requests, pathlib
 
-# — AUTH —
-app = msal.ConfidentialClientApplication(
-    os.environ["AZURE_CLIENT_ID"],
-    authority=f"https://login.microsoftonline.com/{os.environ['AZURE_TENANT_ID']}",
-    client_credential=os.environ["AZURE_CLIENT_SECRET"]
-)
-token_resp = app.acquire_token_for_client(["https://graph.microsoft.com/.default"])
-if "access_token" not in token_resp:
-    print("❌ Azure auth failed:", json.dumps(token_resp, indent=2))
-    exit(1)
-token = token_resp["access_token"]
+          # — AUTH —
+          app = msal.ConfidentialClientApplication(
+              os.environ["AZURE_CLIENT_ID"],
+              authority=f"https://login.microsoftonline.com/{os.environ['AZURE_TENANT_ID']}",
+              client_credential=os.environ["AZURE_CLIENT_SECRET"]
+          )
+          token_resp = app.acquire_token_for_client(["https://graph.microsoft.com/.default"])
+          if "access_token" not in token_resp:
+              print("❌ Azure auth failed:", token_resp)
+              exit(1)
+          token = token_resp["access_token"]
 
-# — BUILD URL —
-site = os.environ["SITE_ID"]
-lst  = os.environ["LIST_ID"]
-url  = (
-    f"https://graph.microsoft.com/v1.0/sites/{site}"
-    f"/lists/{lst}/items"
-    "?$expand=fields&$orderby=fields/CreatedDateTime desc"
-)
+          # — STATE FILE —
+          state = pathlib.Path("last_state.json")
+          last = int(time.time()) - 3600
+          if state.exists():
+              last = json.loads(state.read_text()).get("last", last)
 
-# — STATE FILE —
-state = pathlib.Path("last_state.json")
-last  = int(time.time()) - 3600
-if state.exists():
-    last = json.loads(state.read_text()).get("last", last)
+          # — BUILD GRAPH URL —
+          site = os.environ["SITE_ID"]
+          lst  = os.environ["LIST_ID"]
+          url  = (
+              f"https://graph.microsoft.com/v1.0/sites/{site}"
+              f"/lists/{lst}/items"
+              "?$expand=fields&$orderby=fields/CreatedDateTime desc"
+          )
 
-# — FETCH ITEMS —
-resp = requests.get(url, headers={"Authorization": f"Bearer {token}"})
-if resp.status_code != 200:
-    print("❌ Graph API error:", resp.status_code, resp.text)
-    exit(1)
-items = resp.json().get("value", [])
+          # — FETCH ITEMS —
+          resp = requests.get(url, headers={"Authorization": f"Bearer {token}"})
+          resp.raise_for_status()
+          items = resp.json().get("value", [])
 
-# — SEND NEW ITEMS —
-new_last = last
-for itm in items:
-    created = itm["fields"].get("CreatedDateTime")
-    if not created:
-        continue
-    ts = int(time.mktime(time.strptime(created, "%Y-%m-%dT%H:%M:%SZ")))
-    if ts <= last:
-        break
+          # — SEND NEW ONES TO TELEGRAM —
+          new_last = last
+          for itm in items:
+              created = itm["fields"].get("CreatedDateTime")
+              if not created:
+                  continue
+              ts = int(time.mktime(time.strptime(created, "%Y-%m-%dT%H:%M:%SZ")))
+              if ts <= last:
+                  break
+              title = itm["fields"].get("Title", "(no title)")
+              link  = itm.get("webUrl")
+              text  = f"*{title}*\n{link}"
+              print("➡️ Sending:", text)
+              tg = requests.post(
+                  f"https://api.telegram.org/bot{os.environ['BOT_TOKEN']}/sendMessage",
+                  json={"chat_id": os.environ["CHAT_ID"], "parse_mode": "Markdown", "text": text}
+              )
+              tg.raise_for_status()
+              new_last = max(new_last, ts)
 
-    text = f"*{itm['fields'].get('Title','(no title)')}*\n{itm.get('webUrl')}"
-    print("➡️ Sending to Telegram:", text)
-    tg = requests.post(
-        f"https://api.telegram.org/bot{os.environ['BOT_TOKEN']}/sendMessage",
-        json={"chat_id": os.environ["CHAT_ID"], "parse_mode":"Markdown", "text": text}
-    )
-    if tg.status_code != 200:
-        print("❌ Telegram error:", tg.status_code, tg.text)
-        exit(1)
-    new_last = max(new_last, ts)
-
-state.write_text(json.dumps({"last": new_last}))
-EOF
+          # — UPDATE STATE —
+          state.write_text(json.dumps({"last": new_last}))
+          EOF
