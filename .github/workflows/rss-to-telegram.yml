@@ -2,88 +2,79 @@ name: SharePoint → Telegram
 
 on:
   schedule:
-    - cron: '*/10 * * * *'    # every 10 minutes
-  workflow_dispatch:         # also allow manual runs
+    - cron: '*/10 * * * *'   # every 10 minutes
+  workflow_dispatch:        # manual trigger too
 
 jobs:
   notify:
     runs-on: ubuntu-latest
-
     steps:
-      - name: Check out repo
-        uses: actions/checkout@v3
+      - uses: actions/checkout@v3
 
-      - name: Fetch SP items & notify Telegram
+      - name: Install deps & run notifier
         env:
-          AZURE_CLIENT_ID:     ${{ secrets.AZURE_CLIENT_ID }}
-          AZURE_TENANT_ID:     ${{ secrets.AZURE_TENANT_ID }}
+          AZURE_CLIENT_ID:    ${{ secrets.AZURE_CLIENT_ID }}
           AZURE_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
-          SITE_ID:             ${{ secrets.SITE_ID }}
-          LIST_ID:             ${{ secrets.LIST_ID }}
-          BOT_TOKEN:           ${{ secrets.BOT_TOKEN }}
-          CHAT_ID:             ${{ secrets.CHAT_ID }}
+          AZURE_TENANT_ID:    ${{ secrets.AZURE_TENANT_ID }}
+          SITE_ID:            ${{ secrets.SITE_ID }}
+          LIST_ID:            ${{ secrets.LIST_ID }}
+          BOT_TOKEN:          ${{ secrets.BOT_TOKEN }}
+          CHAT_ID:            ${{ secrets.CHAT_ID }}
         run: |
           pip install msal requests
+          python3 << 'EOF'
+          import os, json, time, msal, requests, pathlib
 
-          python3 - << 'EOF'
-          import os, json, time, requests, pathlib
-          from msal import ConfidentialClientApplication
-          from datetime import datetime
-
-          # 1) Acquire app-only token
-          app = ConfidentialClientApplication(
+          # 1) Authenticate to Graph
+          app = msal.ConfidentialClientApplication(
             os.environ['AZURE_CLIENT_ID'],
             authority=f"https://login.microsoftonline.com/{os.environ['AZURE_TENANT_ID']}",
             client_credential=os.environ['AZURE_CLIENT_SECRET']
           )
-          token = app.acquire_token_for_client(["https://graph.microsoft.com/.default"])["access_token"]
-          headers = {"Authorization": f"Bearer {token}"}
+          token = app.acquire_token_for_client(
+            ["https://graph.microsoft.com/.default"]
+          )["access_token"]
 
-          # 2) Load last-seen timestamp (default = 1 hour ago)
-          state_file = pathlib.Path("last_state.json")
+          # 2) Prepare
+          site   = os.environ['SITE_ID']
+          list_  = os.environ['LIST_ID']
+          bot    = os.environ['BOT_TOKEN']
+          chat   = os.environ['CHAT_ID']
+          state  = pathlib.Path("last_state.json")
+
+          # 3) Last timestamp (default = 1h ago)
           last = int(time.time()) - 3600
-          if state_file.exists():
-            last = json.loads(state_file.read_text()).get("last", last)
+          if state.exists():
+            last = json.loads(state.read_text()).get("last", last)
 
-          # 3) Pull list items sorted by lastModifiedDateTime descending
-          site  = os.environ['SITE_ID']
-          list_ = os.environ['LIST_ID']
-          url   = (
+          # 4) Fetch items (newest first)
+          url = (
             f"https://graph.microsoft.com/v1.0/sites/{site}"
             f"/lists/{list_}/items"
-            "?$expand=fields&$orderby=lastModifiedDateTime desc"
+            "?$expand=fields&$orderby=fields/CreatedDateTime desc"
           )
-          resp = requests.get(url, headers=headers)
+          resp = requests.get(url, headers={"Authorization":f"Bearer {token}"})
           resp.raise_for_status()
           items = resp.json().get("value", [])
 
-          # 4) Send each new/modified item to Telegram
+          # 5) Send any new ones to Telegram
           new_last = last
           for itm in items:
-            mod = itm.get("lastModifiedDateTime")
-            ts  = int(datetime.strptime(mod[:19], "%Y-%m-%dT%H:%M:%S").timestamp())
+            dt = itm["fields"].get("CreatedDateTime") or itm.get("createdDateTime")
+            ts = int(time.mktime(time.strptime(dt, "%Y-%m-%dT%H:%M:%SZ")))
             if ts <= last:
               break
 
-            title = itm.get("fields", {}).get("Title", "(no title)")
-            link  = itm.get("webUrl", "")
+            title = itm["fields"].get("Title","(no title)")
+            link  = itm.get("webUrl")
             text  = f"*{title}*\n{link}"
-
-            requests.post(
-              f"https://api.telegram.org/bot{os.environ['BOT_TOKEN']}/sendMessage",
-              json={"chat_id": os.environ['CHAT_ID'], "parse_mode": "Markdown", "text": text}
-            ).raise_for_status()
-
+            r = requests.post(
+              f"https://api.telegram.org/bot{bot}/sendMessage",
+              json={"chat_id":chat, "parse_mode":"Markdown", "text":text}
+            )
+            r.raise_for_status()
             new_last = max(new_last, ts)
 
-          # 5) Persist the new last-seen timestamp
-          state_file.write_text(json.dumps({"last": new_last}))
+          # 6) Save state
+          state.write_text(json.dumps({"last":new_last}))
           EOF
-
-      - name: Commit updated state
-        run: |
-          git config --local user.email "actions@github.com"
-          git config --local user.name  "GitHub Actions"
-          git add last_state.json
-          git commit -m "Update last_state" || echo "No changes to commit"
-          git push origin HEAD:main || echo "Push failed"
