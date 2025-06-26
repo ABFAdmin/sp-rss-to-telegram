@@ -2,104 +2,86 @@ name: SharePoint → Telegram
 
 on:
   schedule:
-    - cron: '*/10 * * * *'   # every 10 minutes
-  workflow_dispatch:        # also allows manual runs
+    - cron: '*/10 * * * *'    # run every 10 minutes
+  workflow_dispatch:         # also allow manual runs
 
 jobs:
   notify:
     runs-on: ubuntu-latest
-
     steps:
-      - name: Check out repo
-        uses: actions/checkout@v4
-
       - name: Fetch SP items & notify Telegram
         env:
-          BOT_TOKEN:           ${{ secrets.BOT_TOKEN }}
-          CHAT_ID:             ${{ secrets.CHAT_ID }}
           AZURE_TENANT_ID:     ${{ secrets.AZURE_TENANT_ID }}
           AZURE_CLIENT_ID:     ${{ secrets.AZURE_CLIENT_ID }}
           AZURE_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
+          SITE_ID:             ${{ secrets.SITE_ID }}
+          LIST_ID:             ${{ secrets.LIST_ID }}
+          BOT_TOKEN:           ${{ secrets.BOT_TOKEN }}
+          CHAT_ID:             ${{ secrets.CHAT_ID }}
+          STATE_FILE:          last_sp.json
         run: |
-          pip3 install msal requests
+          pip install msal requests
 
           python3 - << 'EOF'
-          import os, json, requests, pathlib
+          import os, json, time, requests, pathlib
           from msal import ConfidentialClientApplication
-          from datetime import datetime
 
-          # Telegram bot & chat
-          bot           = os.environ['BOT_TOKEN']
-          chat          = os.environ['CHAT_ID']
+          # load environment
+          TENANT = os.environ['AZURE_TENANT_ID']
+          CLIENT_ID = os.environ['AZURE_CLIENT_ID']
+          CLIENT_SECRET = os.environ['AZURE_CLIENT_SECRET']
+          SITE_ID = os.environ['SITE_ID']
+          LIST_ID = os.environ['LIST_ID']
+          BOT = os.environ['BOT_TOKEN']
+          CHAT = os.environ['CHAT_ID']
+          STATE_F = pathlib.Path(os.getcwd()) / os.environ['STATE_FILE']
 
-          # Azure AD app credentials
-          tenant        = os.environ['AZURE_TENANT_ID']
-          client_id     = os.environ['AZURE_CLIENT_ID']
-          client_secret = os.environ['AZURE_CLIENT_SECRET']
-
-          # Your SharePoint site and list
-          site_id = "airblowfanscoza.sharepoint.com:/sites/ABF-Manufacturing"
-          list_id = "E33DEFA0-905A-4396-9DBB-64AFC4AF1FA6"
-
-          # State file to persist last timestamp
-          state_file = pathlib.Path("last_state.json")
-          last = int(datetime.utcnow().timestamp()) - 3600
-          if state_file.exists():
-            last = json.loads(state_file.read_text()).get("last", last)
-
-          # Acquire Graph token
-          app   = ConfidentialClientApplication(
-                     client_id,
-                     authority=f"https://login.microsoftonline.com/{tenant}",
-                     client_credential=client_secret
-                   )
-          token = app.acquire_token_for_client(
-                     scopes=["https://graph.microsoft.com/.default"]
-                   )["access_token"]
-          headers = {"Authorization": f"Bearer {token}"}
-
-          # Fetch up to 20 newest items ordered by Created desc
-          url = (
-            f"https://graph.microsoft.com/v1.0/sites/{site_id}"
-            f"/lists/{list_id}/items"
-            "?$top=20&$expand=fields&$orderby=fields/Created desc"
+          # get an app-only token
+          app = ConfidentialClientApplication(
+            CLIENT_ID,
+            authority=f"https://login.microsoftonline.com/{TENANT}",
+            client_credential=CLIENT_SECRET
           )
+          result = app.acquire_token_for_client(scopes=["https://graph.microsoft.com/.default"])
+          token = result.get("access_token")
+          if not token:
+            raise Exception(f"No token: {json.dumps(result)}")
+
+          # load last-run, default 1h ago
+          last = int(time.time()) - 3600
+          if STATE_F.exists():
+            last = json.loads(STATE_F.read_text()).get("last", last)
+
+          # fetch list items, ordered by created date
+          url = (
+            "https://graph.microsoft.com/v1.0"
+            f"/sites/{SITE_ID}/lists/{LIST_ID}/items"
+            "?expand=fields&$orderby=fields/CreatedDateTime"
+          )
+          headers = {"Authorization": "Bearer " + token}
           resp = requests.get(url, headers=headers)
           resp.raise_for_status()
           items = resp.json().get("value", [])
 
           new_last = last
-          for itm in reversed(items):
-            flds = itm.get("fields", {})
-            created = flds.get("Created")
-            try:
-              ts = int(datetime.strptime(created, "%Y-%m-%dT%H:%M:%SZ").timestamp())
-            except:
+          for item in items:
+            f = item.get("fields", {})
+            cd = f.get("CreatedDateTime")
+            if not cd:
               continue
+            ts = int(time.mktime(time.strptime(cd, "%Y-%m-%dT%H:%M:%SZ")))
             if ts <= last:
               continue
 
-            title = flds.get("Title", "(no title)")
-            link  = flds.get("EncodedAbsUrl")
-            text  = f"*{title}*\n{link}"
-
-            post = requests.post(
-              f"https://api.telegram.org/bot{bot}/sendMessage",
-              json={"chat_id": chat, "parse_mode": "Markdown", "text": text}
+            # send to Telegram
+            text = f"*{f.get('Title','(no title)')}*\nCreated: {cd}"
+            r = requests.post(
+              f"https://api.telegram.org/bot{BOT}/sendMessage",
+              json={"chat_id": CHAT, "parse_mode": "Markdown", "text": text}
             )
-            post.raise_for_status()
-
+            r.raise_for_status()
             new_last = max(new_last, ts)
 
-          # Persist new last timestamp
-          with open(state_file, "w") as f:
-            json.dump({"last": new_last}, f)
+          # write cursor
+          STATE_F.write_text(json.dumps({"last": new_last}))
           EOF
-
-      - name: Commit updated state
-        run: |
-          git config --local user.email "actions@github.com"
-          git config --local user.name  "GitHub Actions"
-          git add last_state.json
-          git commit -m "Update last_state" || echo "No changes to commit"
-          git push origin HEAD:main || echo "Push failed"
