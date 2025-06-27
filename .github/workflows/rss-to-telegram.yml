@@ -1,7 +1,6 @@
 name: SharePoint → Telegram
 
 on:
-  # every 10 minutes
   schedule:
     - cron: '*/10 * * * *'
   workflow_dispatch:
@@ -9,13 +8,10 @@ on:
 jobs:
   notify:
     runs-on: ubuntu-latest
-
     steps:
-      # 1) pull your code
       - name: Check out repository
         uses: actions/checkout@v3
 
-      # 2) fetch items & post to Telegram
       - name: Fetch SP items & notify Telegram
         env:
           AZURE_CLIENT_ID:     ${{ secrets.AZURE_CLIENT_ID }}
@@ -29,11 +25,6 @@ jobs:
           set -euo pipefail
           echo "🔧 Installing Python packages..."
           pip install --user msal requests
-
-          echo "🐝 Debug BOT_TOKEN=${BOT_TOKEN:0:10}…"
-          echo "🐝 Debug CHAT_ID=$CHAT_ID"
-          echo "🐝 Debug SITE_ID=$SITE_ID"
-          echo "🐝 Debug LIST_ID=$LIST_ID"
 
           python3 - << 'EOF'
           import os, json, time, msal, requests, pathlib
@@ -50,14 +41,12 @@ jobs:
               exit(1)
           token = token_resp["access_token"]
 
-          # — BUILD Graph URL —
+          # — BUILD Graph URL (single f-string) —
           site = os.environ['SITE_ID']
           lst  = os.environ['LIST_ID']
           url = (
-            f"https://graph.microsoft.com/v1.0/"
-            f"sites/{site}/lists/{lst}/items"
-            f"?$expand=fields"
-            f"&$orderby=createdDateTime%20desc"
+            f"https://graph.microsoft.com/v1.0/sites/{site}/lists/{lst}/items"
+            f"?$expand=fields&$orderby=fields/Created desc"
           )
           print("➡️ Fetching:", url)
 
@@ -75,22 +64,23 @@ jobs:
 
           new_last = last
           for idx, itm in enumerate(items, start=1):
-              dt = itm.get("createdDateTime")
-              print(f"🔄 Loop #{idx} — id={itm.get('id')} createdDateTime={dt}")
+              dt = itm.get("fields", {}).get("Created")  # use the SharePoint “Created” field
+              print(f"🔄 Loop #{idx} — id={itm.get('id')} Created={dt}")
               if not dt:
-                  print("   ↳ SKIP (no createdDateTime)")
+                  print("   ↳ SKIP (no Created)")
                   continue
 
+              # parse the SP “Created” value (e.g. "2025-06-27T12:34:56Z")
               ts = int(time.mktime(time.strptime(dt, "%Y-%m-%dT%H:%M:%SZ")))
               print(f"   ↳ parsed ts={ts}, last={last}")
               if ts <= last:
                   print("   ↳ BREAK (already processed)")
                   break
 
-              title = itm.get("fields", {}).get("Title", "<no title>")
+              title = itm["fields"].get("Title", "<no title>")
               link  = itm.get("webUrl")
               print(f"   ↳ SENDING message: {title}")
-              p = requests.post(
+              r = requests.post(
                 f"https://api.telegram.org/bot{os.environ['BOT_TOKEN']}/sendMessage",
                 json={
                   "chat_id": os.environ['CHAT_ID'],
@@ -98,7 +88,7 @@ jobs:
                   "text": f"*{title}*\n{link}"
                 }
               )
-              p.raise_for_status()
+              r.raise_for_status()
               new_last = max(new_last, ts)
               print(f"   ↳ new_last updated to {new_last}")
 
