@@ -1,5 +1,6 @@
 name: SharePoint → Telegram
 
+# Run every 10 minutes + allow manual dispatch
 on:
   schedule:
     - cron: '*/10 * * * *'
@@ -8,35 +9,36 @@ on:
 jobs:
   notify:
     runs-on: ubuntu-latest
-    env:
-      AZURE_CLIENT_ID:     ${{ secrets.AZURE_CLIENT_ID }}
-      AZURE_TENANT_ID:     ${{ secrets.AZURE_TENANT_ID }}
-      AZURE_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
-      SITE_ID:             ${{ secrets.SITE_ID }}
-      LIST_ID:             ${{ secrets.LIST_ID }}
-      BOT_TOKEN:           ${{ secrets.BOT_TOKEN }}
-      CHAT_ID:             ${{ secrets.CHAT_ID }}
 
     steps:
+      # 1) pull your code
       - name: Check out repository
         uses: actions/checkout@v3
 
-      - name: Restore last_state cache
-        uses: actions/cache@v3
-        with:
-          path: last_state.json
-          # key should be unique per list
-          key: state-${{ env.SITE_ID }}-${{ env.LIST_ID }}
-
+      # 2) fetch items & post to Telegram
       - name: Fetch SP items & notify Telegram
+        env:
+          AZURE_CLIENT_ID:     ${{ secrets.AZURE_CLIENT_ID }}
+          AZURE_TENANT_ID:     ${{ secrets.AZURE_TENANT_ID }}
+          AZURE_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
+          SITE_ID:             ${{ secrets.SITE_ID }}
+          LIST_ID:             ${{ secrets.LIST_ID }}
+          BOT_TOKEN:           ${{ secrets.BOT_TOKEN }}
+          CHAT_ID:             ${{ secrets.CHAT_ID }}
         run: |
           set -euo pipefail
+          echo "🔧 Installing Python packages..."
           pip install --user msal requests
+
+          echo "🐝 Debug BOT_TOKEN=${BOT_TOKEN:0:10}…"
+          echo "🐝 Debug CHAT_ID=$CHAT_ID"
+          echo "🐝 Debug SITE_ID=$SITE_ID"
+          echo "🐝 Debug LIST_ID=$LIST_ID"
 
           python3 - << 'EOF'
           import os, json, time, msal, requests, pathlib
 
-          # Auth
+          # — AUTH with Azure AD —
           app = msal.ConfidentialClientApplication(
             os.environ['AZURE_CLIENT_ID'],
             authority=f"https://login.microsoftonline.com/{os.environ['AZURE_TENANT_ID']}",
@@ -44,11 +46,13 @@ jobs:
           )
           token_resp = app.acquire_token_for_client(["https://graph.microsoft.com/.default"])
           if "access_token" not in token_resp:
-            print("❌ Azure auth failed:", token_resp); exit(1)
+              print("❌ Azure auth failed:", json.dumps(token_resp, indent=2))
+              exit(1)
           token = token_resp["access_token"]
 
-          # Build URL
-          site = os.environ['SITE_ID']; lst = os.environ['LIST_ID']
+          # — BUILD Graph URL —
+          site = os.environ['SITE_ID']
+          lst  = os.environ['LIST_ID']
           url = (
             f"https://graph.microsoft.com/v1.0/sites/{site}"
             f"/lists/{lst}/items"
@@ -57,13 +61,13 @@ jobs:
           )
           print("➡️ Fetching:", url)
 
-          # Load last timestamp (default: 0 so we catch everything once)
+          # — LOAD last timestamp (default: 1 hour ago) —
           state_file = pathlib.Path("last_state.json")
-          last = 0
+          last = int(time.time()) - 3600
           if state_file.exists():
               last = json.loads(state_file.read_text()).get("last", last)
 
-          # Fetch & Loop
+          # — FETCH & LOOP —
           resp = requests.get(url, headers={"Authorization": f"Bearer {token}"})
           resp.raise_for_status()
           items = resp.json().get("value", [])
@@ -72,29 +76,32 @@ jobs:
           new_last = last
           for idx, itm in enumerate(items, start=1):
               dt = itm.get("createdDateTime")
-              if not dt: continue
+              print(f"🔄 Loop #{idx} — id={itm.get('id')} createdDateTime={dt}")
+              if not dt:
+                  print("   ↳ SKIP (no createdDateTime)")
+                  continue
+
               ts = int(time.mktime(time.strptime(dt, "%Y-%m-%dT%H:%M:%SZ")))
+              print(f"   ↳ parsed ts={ts}, last={last}")
               if ts <= last:
-                  print(f"↳ already processed (ts={ts} <= last={last}); stopping loop")
+                  print("   ↳ BREAK (already processed)")
                   break
 
               title = itm.get("fields", {}).get("Title", "<no title>")
               link  = itm.get("webUrl")
-              print(f"↳ Sending: {title}")
-              requests.post(
+              print(f"   ↳ SENDING message: {title}")
+              p = requests.post(
                 f"https://api.telegram.org/bot{os.environ['BOT_TOKEN']}/sendMessage",
-                json={"chat_id": os.environ['CHAT_ID'],
-                      "parse_mode": "Markdown",
-                      "text": f"*{title}*\n{link}"}
-              ).raise_for_status()
+                json={
+                  "chat_id": os.environ['CHAT_ID'],
+                  "parse_mode": "HTML",
+                  "text": f"<b>{title}</b>\n{link}"
+                }
+              )
+              p.raise_for_status()
               new_last = max(new_last, ts)
+              print(f"   ↳ new_last updated to {new_last}")
 
-          # Save state
+          # — SAVE state —
           state_file.write_text(json.dumps({"last": new_last}))
           EOF
-
-      - name: Save last_state cache
-        uses: actions/cache@v3
-        with:
-          path: last_state.json
-          key: state-${{ env.SITE_ID }}-${{ env.LIST_ID }}
