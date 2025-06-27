@@ -1,205 +1,67 @@
-name: SharePoint → Telegram
-# Run every 10 minutes + allow manual dispatch
+name: SharePoint → Telegram (Multi-List)
 on:
   schedule:
-    - cron: '*/10 * * * *'  # Fixed: added missing fields
+    - cron: '*/10 * * * *'
   workflow_dispatch:
 
 jobs:
-  notify:
+  notify-boilermaking:
     runs-on: ubuntu-latest
     steps:
       - name: Check out repository
-        uses: actions/checkout@v4  # Updated to v4
+        uses: actions/checkout@v4
         
-      - name: Fetch SP items & notify Telegram
+      - name: Notify Boilermaking List
         env:
           AZURE_CLIENT_ID:     ${{ secrets.AZURE_CLIENT_ID }}
           AZURE_TENANT_ID:     ${{ secrets.AZURE_TENANT_ID }}
           AZURE_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
           SITE_ID:             ${{ secrets.SITE_ID }}
-          LIST_ID:             ${{ secrets.LIST_ID }}
+          LIST_ID:             ${{ secrets.BOILERMAKING_LIST_ID }}
           BOT_TOKEN:           ${{ secrets.BOT_TOKEN }}
-          CHAT_ID:             ${{ secrets.CHAT_ID }}
+          CHAT_ID:             ${{ secrets.BOILERMAKING_CHAT_ID }}
+          LAST_CHECK_TIMESTAMP: ${{ vars.BOILERMAKING_LAST_CHECK }}
+          LIST_NAME:           "🔥 Boilermaking"
         run: |
-          set -euo pipefail
-          echo "🔧 Installing Python packages..."
-          pip install --user msal requests python-dateutil
-          
-          echo "🐝 Debug BOT_TOKEN=${BOT_TOKEN:0:10}…"
-          echo "🐝 Debug CHAT_ID=$CHAT_ID"
-          echo "🐝 Debug SITE_ID=$SITE_ID"
-          echo "🐝 Debug LIST_ID=$LIST_ID"
-          
-          python3 - << 'EOF'
-          import os, json, time, msal, requests, pathlib
-          from dateutil import parser
-          
-          # — AUTH with Azure AD —
-          app = msal.ConfidentialClientApplication(
-              os.environ['AZURE_CLIENT_ID'],
-              authority=f"https://login.microsoftonline.com/{os.environ['AZURE_TENANT_ID']}",
-              client_credential=os.environ['AZURE_CLIENT_SECRET']
-          )
-          
-          token_resp = app.acquire_token_for_client(["https://graph.microsoft.com/.default"])
-          if "access_token" not in token_resp:
-              print("❌ Azure auth failed:", json.dumps(token_resp, indent=2))
-              exit(1)
-          
-          token = token_resp["access_token"]
-          print("✅ Azure authentication successful")
-          
-          # — BUILD Graph URL —
-          site = os.environ['SITE_ID']
-          lst  = os.environ['LIST_ID']
-          
-          # Try multiple approaches to get recent items
-          urls_to_try = [
-              # Try lastModifiedDateTime first (since items are being updated)
-              (f"https://graph.microsoft.com/v1.0/sites/{site}/lists/{lst}/items"
-               f"?$expand=fields&$orderby=lastModifiedDateTime desc&$top=10", "lastModifiedDateTime desc"),
-               
-              # Original approach as fallback
-              (f"https://graph.microsoft.com/v1.0/sites/{site}/lists/{lst}/items"
-               f"?$expand=fields&$orderby=createdDateTime desc&$top=10", "createdDateTime desc"),
-               
-              # Try without ordering to see all items
-              (f"https://graph.microsoft.com/v1.0/sites/{site}/lists/{lst}/items"
-               f"?$expand=fields&$top=50", "no ordering")
-          ]
-          
-          for url, description in urls_to_try:
-              print(f"\n➡️ Trying {description}: {url}")
-              try:
-                  resp = requests.get(url, headers={"Authorization": f"Bearer {token}"})
-                  resp.raise_for_status()
-                  data = resp.json()
-                  items = data.get("value", [])
-                  print(f"   🔢 Got {len(items)} items with {description}")
-                  
-                  if items:
-                      print(f"   📅 Most recent 3 items:")
-                      for i, item in enumerate(items[:3]):
-                          created = item.get("createdDateTime")
-                          modified = item.get("lastModifiedDateTime")
-                          title = item.get("fields", {}).get("Title", "No title")
-                          print(f"     {i+1}. '{title}' - created: {created}, modified: {modified}")
-                      
-                      # Use the first successful query for processing
-                      if description == "lastModifiedDateTime desc":
-                          break
-              except Exception as e:
-                  print(f"   ❌ Failed with {description}: {e}")
-                  continue
-          
-          # — Use environment variable or default to 24 hours ago for debugging —
-          last_check_env = os.environ.get('LAST_CHECK_TIMESTAMP')
-          if last_check_env:
-              last = int(last_check_env)
-              print(f"📅 Using last check from env: {last}")
-          else:
-              last = int(time.time()) - (24 * 3600)  # 24 hours ago for debugging
-              print(f"📅 Using default last check (24h ago): {last}")
-              print(f"📅 Current time: {int(time.time())}")
-              print(f"📅 Looking for items newer than: {time.strftime('%Y-%m-%d %H:%M:%S UTC', time.gmtime(last))}")
-          
-          # — FETCH & LOOP —
-          try:
-              resp = requests.get(url, headers={"Authorization": f"Bearer {token}"})
-              resp.raise_for_status()
-              data = resp.json()
-              items = data.get("value", [])
-              print(f"🔢 Received {len(items)} items")
-              
-              # DEBUG: Print full response structure
-              print("🔍 DEBUG: Full API response keys:", list(data.keys()))
-              if items:
-                  print("🔍 DEBUG: First item keys:", list(items[0].keys()))
-                  print("🔍 DEBUG: First item fields:", list(items[0].get("fields", {}).keys()))
-                  print("🔍 DEBUG: All creation dates:")
-                  for i, item in enumerate(items[:10]):  # Show first 10
-                      created = item.get("createdDateTime")
-                      modified = item.get("lastModifiedDateTime") 
-                      print(f"  Item {i+1}: created={created}, modified={modified}")
-              
-              new_last = last
-              messages_sent = 0
-              
-              for idx, itm in enumerate(items, start=1):
-                  # Check both created and modified dates
-                  created_dt = itm.get("createdDateTime")
-                  modified_dt = itm.get("lastModifiedDateTime")
-                  
-                  print(f"🔄 Processing item #{idx} — id={itm.get('id')}")
-                  print(f"   created={created_dt}, modified={modified_dt}")
-                  
-                  # Use the more recent of created or modified date
-                  dt_to_check = modified_dt if modified_dt else created_dt
-                  date_type = "modified" if modified_dt and (not created_dt or modified_dt > created_dt) else "created"
-                  
-                  if not dt_to_check:
-                      print("   ↳ SKIP (no timestamp)")
-                      continue
-                  
-                  # Better date parsing
-                  try:
-                      parsed_dt = parser.parse(dt_to_check)
-                      ts = int(parsed_dt.timestamp())
-                  except Exception as e:
-                      print(f"   ↳ SKIP (date parse error: {e})")
-                      continue
-                  
-                  print(f"   ↳ Using {date_type} timestamp: {ts}, threshold: {last}")
-                  
-                  if ts <= last:
-                      print("   ↳ BREAK (already processed)")
-                      break
-                  
-                  # Get item details
-                  fields = itm.get("fields", {})
-                  title = fields.get("Title", "New SharePoint Item")
-                  link = itm.get("webUrl", "")
-                  
-                  # Create message
-                  message = f"📋 <b>{title}</b>"
-                  if created_dt != modified_dt and date_type == "modified":
-                      message += f"\n✏️ <i>Updated</i>"
-                  if link:
-                      message += f"\n🔗 <a href='{link}'>View Item</a>"
-                  
-                  print(f"   ↳ SENDING message: {title}")
-                  
-                  # Send to Telegram
-                  try:
-                      telegram_resp = requests.post(
-                          f"https://api.telegram.org/bot{os.environ['BOT_TOKEN']}/sendMessage",
-                          json={
-                              "chat_id": os.environ['CHAT_ID'],
-                              "parse_mode": "HTML",
-                              "text": message,
-                              "disable_web_page_preview": False
-                          },
-                          timeout=30
-                      )
-                      telegram_resp.raise_for_status()
-                      messages_sent += 1
-                      print(f"   ↳ ✅ Message sent successfully")
-                  except Exception as e:
-                      print(f"   ↳ ❌ Telegram send failed: {e}")
-                      continue
-                  
-                  new_last = max(new_last, ts)
-                  print(f"   ↳ new_last updated to {new_last}")
-              
-              print(f"🎉 Completed! Sent {messages_sent} messages")
-              print(f"💾 Would save new_last: {new_last}")
-              
-          except requests.exceptions.RequestException as e:
-              print(f"❌ API request failed: {e}")
-              exit(1)
-          except Exception as e:
-              print(f"❌ Unexpected error: {e}")
-              exit(1)
-          
-          EOF
+          # Your Python script here (same as above)
+          # Add LIST_NAME to the Telegram message for identification
+
+  notify-rolling:
+    runs-on: ubuntu-latest  
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        
+      - name: Notify Rolling List
+        env:
+          AZURE_CLIENT_ID:     ${{ secrets.AZURE_CLIENT_ID }}
+          AZURE_TENANT_ID:     ${{ secrets.AZURE_TENANT_ID }}
+          AZURE_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
+          SITE_ID:             ${{ secrets.SITE_ID }}
+          LIST_ID:             ${{ secrets.ROLLING_LIST_ID }}
+          BOT_TOKEN:           ${{ secrets.BOT_TOKEN }}
+          CHAT_ID:             ${{ secrets.ROLLING_CHAT_ID }}
+          LAST_CHECK_TIMESTAMP: ${{ vars.ROLLING_LAST_CHECK }}
+          LIST_NAME:           "🌀 Rolling"
+        run: |
+          # Same Python script
+
+  notify-bending:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        
+      - name: Notify Bending List  
+        env:
+          AZURE_CLIENT_ID:     ${{ secrets.AZURE_CLIENT_ID }}
+          AZURE_TENANT_ID:     ${{ secrets.AZURE_TENANT_ID }}
+          AZURE_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
+          SITE_ID:             ${{ secrets.SITE_ID }}
+          LIST_ID:             ${{ secrets.BENDING_LIST_ID }}
+          BOT_TOKEN:           ${{ secrets.BOT_TOKEN }}  
+          CHAT_ID:             ${{ secrets.BENDING_CHAT_ID }}
+          LAST_CHECK_TIMESTAMP: ${{ vars.BENDING_LAST_CHECK }}
+          LIST_NAME:           "🔧 Bending"
+        run: |
+          # Same Python script
