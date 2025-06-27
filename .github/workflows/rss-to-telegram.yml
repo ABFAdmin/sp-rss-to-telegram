@@ -56,13 +56,13 @@ jobs:
           
           # Try multiple approaches to get recent items
           urls_to_try = [
-              # Original approach
-              (f"https://graph.microsoft.com/v1.0/sites/{site}/lists/{lst}/items"
-               f"?$expand=fields&$orderby=createdDateTime desc&$top=10", "createdDateTime desc"),
-              
-              # Try lastModifiedDateTime instead
+              # Try lastModifiedDateTime first (since items are being updated)
               (f"https://graph.microsoft.com/v1.0/sites/{site}/lists/{lst}/items"
                f"?$expand=fields&$orderby=lastModifiedDateTime desc&$top=10", "lastModifiedDateTime desc"),
+               
+              # Original approach as fallback
+              (f"https://graph.microsoft.com/v1.0/sites/{site}/lists/{lst}/items"
+               f"?$expand=fields&$orderby=createdDateTime desc&$top=10", "createdDateTime desc"),
                
               # Try without ordering to see all items
               (f"https://graph.microsoft.com/v1.0/sites/{site}/lists/{lst}/items"
@@ -87,7 +87,7 @@ jobs:
                           print(f"     {i+1}. '{title}' - created: {created}, modified: {modified}")
                       
                       # Use the first successful query for processing
-                      if description == "createdDateTime desc":
+                      if description == "lastModifiedDateTime desc":
                           break
               except Exception as e:
                   print(f"   ❌ Failed with {description}: {e}")
@@ -127,22 +127,30 @@ jobs:
               messages_sent = 0
               
               for idx, itm in enumerate(items, start=1):
-                  dt = itm.get("createdDateTime")
-                  print(f"🔄 Processing item #{idx} — id={itm.get('id')} createdDateTime={dt}")
+                  # Check both created and modified dates
+                  created_dt = itm.get("createdDateTime")
+                  modified_dt = itm.get("lastModifiedDateTime")
                   
-                  if not dt:
-                      print("   ↳ SKIP (no createdDateTime)")
+                  print(f"🔄 Processing item #{idx} — id={itm.get('id')}")
+                  print(f"   created={created_dt}, modified={modified_dt}")
+                  
+                  # Use the more recent of created or modified date
+                  dt_to_check = modified_dt if modified_dt else created_dt
+                  date_type = "modified" if modified_dt and (not created_dt or modified_dt > created_dt) else "created"
+                  
+                  if not dt_to_check:
+                      print("   ↳ SKIP (no timestamp)")
                       continue
                   
                   # Better date parsing
                   try:
-                      parsed_dt = parser.parse(dt)
+                      parsed_dt = parser.parse(dt_to_check)
                       ts = int(parsed_dt.timestamp())
                   except Exception as e:
                       print(f"   ↳ SKIP (date parse error: {e})")
                       continue
                   
-                  print(f"   ↳ parsed ts={ts}, last={last}")
+                  print(f"   ↳ Using {date_type} timestamp: {ts}, threshold: {last}")
                   
                   if ts <= last:
                       print("   ↳ BREAK (already processed)")
@@ -155,6 +163,8 @@ jobs:
                   
                   # Create message
                   message = f"📋 <b>{title}</b>"
+                  if created_dt != modified_dt and date_type == "modified":
+                      message += f"\n✏️ <i>Updated</i>"
                   if link:
                       message += f"\n🔗 <a href='{link}'>View Item</a>"
                   
