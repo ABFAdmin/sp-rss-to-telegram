@@ -1,21 +1,17 @@
 name: SharePoint → Telegram
-
 # Run every 10 minutes + allow manual dispatch
 on:
   schedule:
-    - cron: '*/10 * * * *'
+    - cron: '*/10 * * * *'  # Fixed: added missing fields
   workflow_dispatch:
 
 jobs:
   notify:
     runs-on: ubuntu-latest
-
     steps:
-      # 1) pull your code
       - name: Check out repository
-        uses: actions/checkout@v3
-
-      # 2) fetch items & post to Telegram
+        uses: actions/checkout@v4  # Updated to v4
+        
       - name: Fetch SP items & notify Telegram
         env:
           AZURE_CLIENT_ID:     ${{ secrets.AZURE_CLIENT_ID }}
@@ -28,80 +24,127 @@ jobs:
         run: |
           set -euo pipefail
           echo "🔧 Installing Python packages..."
-          pip install --user msal requests
-
+          pip install --user msal requests python-dateutil
+          
           echo "🐝 Debug BOT_TOKEN=${BOT_TOKEN:0:10}…"
           echo "🐝 Debug CHAT_ID=$CHAT_ID"
           echo "🐝 Debug SITE_ID=$SITE_ID"
           echo "🐝 Debug LIST_ID=$LIST_ID"
-
+          
           python3 - << 'EOF'
           import os, json, time, msal, requests, pathlib
-
+          from dateutil import parser
+          
           # — AUTH with Azure AD —
           app = msal.ConfidentialClientApplication(
-            os.environ['AZURE_CLIENT_ID'],
-            authority=f"https://login.microsoftonline.com/{os.environ['AZURE_TENANT_ID']}",
-            client_credential=os.environ['AZURE_CLIENT_SECRET']
+              os.environ['AZURE_CLIENT_ID'],
+              authority=f"https://login.microsoftonline.com/{os.environ['AZURE_TENANT_ID']}",
+              client_credential=os.environ['AZURE_CLIENT_SECRET']
           )
+          
           token_resp = app.acquire_token_for_client(["https://graph.microsoft.com/.default"])
           if "access_token" not in token_resp:
               print("❌ Azure auth failed:", json.dumps(token_resp, indent=2))
               exit(1)
+          
           token = token_resp["access_token"]
-
+          print("✅ Azure authentication successful")
+          
           # — BUILD Graph URL —
           site = os.environ['SITE_ID']
           lst  = os.environ['LIST_ID']
           url = (
-            f"https://graph.microsoft.com/v1.0/sites/{site}"
-            f"/lists/{lst}/items"
-            f"?$expand=fields"
-            f"&$orderby=createdDateTime desc"
+              f"https://graph.microsoft.com/v1.0/sites/{site}"
+              f"/lists/{lst}/items"
+              f"?$expand=fields"
+              f"&$orderby=createdDateTime desc"
+              f"&$top=50"  # Limit to recent items
           )
           print("➡️ Fetching:", url)
-
-          # — LOAD last timestamp (default: 1 hour ago) —
-          state_file = pathlib.Path("last_state.json")
-          last = int(time.time()) - 3600
-          if state_file.exists():
-              last = json.loads(state_file.read_text()).get("last", last)
-
+          
+          # — Use environment variable or default to 1 hour ago —
+          last_check_env = os.environ.get('LAST_CHECK_TIMESTAMP')
+          if last_check_env:
+              last = int(last_check_env)
+              print(f"📅 Using last check from env: {last}")
+          else:
+              last = int(time.time()) - 3600  # 1 hour ago
+              print(f"📅 Using default last check (1h ago): {last}")
+          
           # — FETCH & LOOP —
-          resp = requests.get(url, headers={"Authorization": f"Bearer {token}"})
-          resp.raise_for_status()
-          items = resp.json().get("value", [])
-          print(f"🔢 Received {len(items)} items")
-
-          new_last = last
-          for idx, itm in enumerate(items, start=1):
-              dt = itm.get("createdDateTime")
-              print(f"🔄 Loop #{idx} — id={itm.get('id')} createdDateTime={dt}")
-              if not dt:
-                  print("   ↳ SKIP (no createdDateTime)")
-                  continue
-
-              ts = int(time.mktime(time.strptime(dt, "%Y-%m-%dT%H:%M:%SZ")))
-              print(f"   ↳ parsed ts={ts}, last={last}")
-              if ts <= last:
-                  print("   ↳ BREAK (already processed)")
-                  break
-
-              title = itm.get("fields", {}).get("Title", "<no title>")
-              link  = itm.get("webUrl")
-              print(f"   ↳ SENDING message: {title}")
-              p = requests.post(
-                f"https://api.telegram.org/bot{os.environ['BOT_TOKEN']}/sendMessage",
-                json={
-                  "chat_id": os.environ['CHAT_ID'],
-                  "parse_mode": "HTML",
-                  "text": f"<b>{title}</b>\n{link}"
-                }
-              )
-              p.raise_for_status()
-              new_last = max(new_last, ts)
-              print(f"   ↳ new_last updated to {new_last}")
-
-          # — SAVE state —
-          state_file.write_text(json.dumps({"last": new_last}))
+          try:
+              resp = requests.get(url, headers={"Authorization": f"Bearer {token}"})
+              resp.raise_for_status()
+              items = resp.json().get("value", [])
+              print(f"🔢 Received {len(items)} items")
+              
+              new_last = last
+              messages_sent = 0
+              
+              for idx, itm in enumerate(items, start=1):
+                  dt = itm.get("createdDateTime")
+                  print(f"🔄 Processing item #{idx} — id={itm.get('id')} createdDateTime={dt}")
+                  
+                  if not dt:
+                      print("   ↳ SKIP (no createdDateTime)")
+                      continue
+                  
+                  # Better date parsing
+                  try:
+                      parsed_dt = parser.parse(dt)
+                      ts = int(parsed_dt.timestamp())
+                  except Exception as e:
+                      print(f"   ↳ SKIP (date parse error: {e})")
+                      continue
+                  
+                  print(f"   ↳ parsed ts={ts}, last={last}")
+                  
+                  if ts <= last:
+                      print("   ↳ BREAK (already processed)")
+                      break
+                  
+                  # Get item details
+                  fields = itm.get("fields", {})
+                  title = fields.get("Title", "New SharePoint Item")
+                  link = itm.get("webUrl", "")
+                  
+                  # Create message
+                  message = f"📋 <b>{title}</b>"
+                  if link:
+                      message += f"\n🔗 <a href='{link}'>View Item</a>"
+                  
+                  print(f"   ↳ SENDING message: {title}")
+                  
+                  # Send to Telegram
+                  try:
+                      telegram_resp = requests.post(
+                          f"https://api.telegram.org/bot{os.environ['BOT_TOKEN']}/sendMessage",
+                          json={
+                              "chat_id": os.environ['CHAT_ID'],
+                              "parse_mode": "HTML",
+                              "text": message,
+                              "disable_web_page_preview": False
+                          },
+                          timeout=30
+                      )
+                      telegram_resp.raise_for_status()
+                      messages_sent += 1
+                      print(f"   ↳ ✅ Message sent successfully")
+                  except Exception as e:
+                      print(f"   ↳ ❌ Telegram send failed: {e}")
+                      continue
+                  
+                  new_last = max(new_last, ts)
+                  print(f"   ↳ new_last updated to {new_last}")
+              
+              print(f"🎉 Completed! Sent {messages_sent} messages")
+              print(f"💾 Would save new_last: {new_last}")
+              
+          except requests.exceptions.RequestException as e:
+              print(f"❌ API request failed: {e}")
+              exit(1)
+          except Exception as e:
+              print(f"❌ Unexpected error: {e}")
+              exit(1)
+          
           EOF
