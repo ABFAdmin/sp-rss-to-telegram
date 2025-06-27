@@ -29,7 +29,7 @@ jobs:
           python3 - << 'EOF'
           import os, json, time, msal, requests, pathlib
 
-          # — AUTH with Azure AD —
+          # — AUTH —
           app = msal.ConfidentialClientApplication(
             os.environ['AZURE_CLIENT_ID'],
             authority=f"https://login.microsoftonline.com/{os.environ['AZURE_TENANT_ID']}",
@@ -41,16 +41,16 @@ jobs:
               exit(1)
           token = token_resp["access_token"]
 
-          # — BUILD Graph URL (single f-string) —
+          # — BUILD URL (one f-string!) —
           site = os.environ['SITE_ID']
           lst  = os.environ['LIST_ID']
           url = (
             f"https://graph.microsoft.com/v1.0/sites/{site}/lists/{lst}/items"
-            f"?$expand=fields&$orderby=fields/Created desc"
+            f"?$expand=fields&$orderby=createdDateTime desc"
           )
           print("➡️ Fetching:", url)
 
-          # — LOAD last timestamp (default: 1 hour ago) —
+          # — LOAD last timestamp (default: 1h ago) —
           state_file = pathlib.Path("last_state.json")
           last = int(time.time()) - 3600
           if state_file.exists():
@@ -64,22 +64,18 @@ jobs:
 
           new_last = last
           for idx, itm in enumerate(items, start=1):
-              dt = itm.get("fields", {}).get("Created")  # use the SharePoint “Created” field
-              print(f"🔄 Loop #{idx} — id={itm.get('id')} Created={dt}")
+              dt = itm.get("createdDateTime")
+              print(f"🔄 Loop #{idx} — id={itm['id']} createdDateTime={dt}")
               if not dt:
-                  print("   ↳ SKIP (no Created)")
                   continue
 
-              # parse the SP “Created” value (e.g. "2025-06-27T12:34:56Z")
               ts = int(time.mktime(time.strptime(dt, "%Y-%m-%dT%H:%M:%SZ")))
-              print(f"   ↳ parsed ts={ts}, last={last}")
               if ts <= last:
-                  print("   ↳ BREAK (already processed)")
                   break
 
               title = itm["fields"].get("Title", "<no title>")
               link  = itm.get("webUrl")
-              print(f"   ↳ SENDING message: {title}")
+              print(f"   ↳ SENDING: {title}")
               r = requests.post(
                 f"https://api.telegram.org/bot{os.environ['BOT_TOKEN']}/sendMessage",
                 json={
@@ -90,8 +86,6 @@ jobs:
               )
               r.raise_for_status()
               new_last = max(new_last, ts)
-              print(f"   ↳ new_last updated to {new_last}")
 
-          # — SAVE state —
           state_file.write_text(json.dumps({"last": new_last}))
           EOF
